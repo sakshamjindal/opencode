@@ -1580,244 +1580,585 @@ def serve(
 
 ---
 
-## Phase 7: Web Frontend (Days 23-28)
+## Phase 7: Textual TUI (Days 23-26)
 
-### Goal: Browser-based UI using HTMX + Jinja2
+### Goal: Beautiful, feature-rich terminal UI with Textual
 
-#### 7.1 Why HTMX?
-- No JavaScript framework needed
-- Server-rendered HTML
-- SSE support built-in
-- Perfect for Python backends
-- ~14KB total
+#### 7.1 Why Textual?
+- CSS-like styling system
+- Reactive widgets with automatic updates
+- Mouse support and scrolling
+- Async-first architecture
+- Hot reload during development
+- Professional look out of the box
 
-#### 7.2 Templates Setup
+#### 7.2 Install Dependencies
+```bash
+uv add textual httpx
+# or
+pip install textual httpx
+```
+
+#### 7.3 Project Structure for TUI
+```
+src/opencode/tui/
+├── __init__.py
+├── app.py              # Main Textual app
+├── screens/
+│   ├── __init__.py
+│   ├── home.py         # Session list screen
+│   └── chat.py         # Chat screen
+├── widgets/
+│   ├── __init__.py
+│   ├── message.py      # Message display widget
+│   ├── tool_call.py    # Tool call widget
+│   └── input.py        # Enhanced input widget
+├── styles.tcss         # Textual CSS styles
+└── client.py           # API client for server communication
+```
+
+#### 7.4 API Client
 ```python
-# src/opencode/server/templates.py
-from fastapi import Request
-from fastapi.templating import Jinja2Templates
-from pathlib import Path
+# src/opencode/tui/client.py
+import httpx
+import json
+from typing import AsyncGenerator
+from dataclasses import dataclass
 
-templates = Jinja2Templates(
-    directory=Path(__file__).parent / "templates"
-)
+@dataclass
+class StreamEvent:
+    type: str  # "text" | "tool_call" | "tool_result" | "done"
+    data: dict
+
+class OpenCodeClient:
+    def __init__(self, base_url: str = "http://localhost:8080"):
+        self.base_url = base_url
+        self.client = httpx.AsyncClient(timeout=120)
+
+    async def list_sessions(self) -> list[dict]:
+        response = await self.client.get(f"{self.base_url}/api/session")
+        return response.json()
+
+    async def create_session(self) -> dict:
+        response = await self.client.post(f"{self.base_url}/api/session", json={})
+        return response.json()
+
+    async def get_session(self, session_id: str) -> dict:
+        response = await self.client.get(f"{self.base_url}/api/session/{session_id}")
+        return response.json()
+
+    async def send_message(self, session_id: str, content: str) -> AsyncGenerator[StreamEvent, None]:
+        """Stream message response via SSE"""
+        async with self.client.stream(
+            "POST",
+            f"{self.base_url}/api/session/{session_id}/message",
+            json={"content": content}
+        ) as response:
+            async for line in response.aiter_lines():
+                if line.startswith("event:"):
+                    event_type = line[6:].strip()
+                elif line.startswith("data:"):
+                    data = json.loads(line[5:])
+                    yield StreamEvent(type=event_type, data=data)
+
+    async def close(self):
+        await self.client.aclose()
 ```
 
-#### 7.3 Web Routes
+#### 7.5 Message Widget
 ```python
-# src/opencode/server/web.py
-from fastapi import APIRouter, Request
-from fastapi.responses import HTMLResponse
-from .templates import templates
-from ..storage import list_sessions, load_session
+# src/opencode/tui/widgets/message.py
+from textual.widgets import Static
+from textual.reactive import reactive
+from rich.markdown import Markdown
+from rich.panel import Panel
+from rich.syntax import Syntax
 
-router = APIRouter()
+class MessageWidget(Static):
+    """Display a single message with role styling"""
 
-@router.get("/", response_class=HTMLResponse)
-async def home(request: Request):
-    """Home page with session list"""
-    sessions = list_sessions()
-    return templates.TemplateResponse(
-        "home.html",
-        {"request": request, "sessions": sessions}
-    )
+    role = reactive("user")
+    content = reactive("")
+
+    def __init__(self, role: str, content: str = "", **kwargs):
+        super().__init__(**kwargs)
+        self.role = role
+        self.content = content
+        self.classes = role  # Apply CSS class
+
+    def render(self):
+        title = "You" if self.role == "user" else "Assistant"
+        style = "blue" if self.role == "user" else "green"
+
+        # Try to render markdown for assistant messages
+        if self.role == "assistant":
+            try:
+                rendered = Markdown(self.content)
+            except:
+                rendered = self.content
+        else:
+            rendered = self.content
+
+        return Panel(rendered, title=title, border_style=style)
+
+    def append_content(self, text: str):
+        """Append text to content (for streaming)"""
+        self.content += text
+        self.refresh()
 
 
-@router.get("/session/{session_id}", response_class=HTMLResponse)
-async def session_page(request: Request, session_id: str):
-    """Session chat page"""
-    session = load_session(session_id)
-    return templates.TemplateResponse(
-        "session.html",
-        {"request": request, "session": session}
-    )
+class ToolCallWidget(Static):
+    """Display a tool call"""
+
+    def __init__(self, name: str, input_data: dict, **kwargs):
+        super().__init__(**kwargs)
+        self.tool_name = name
+        self.input_data = input_data
+        self.classes = "tool-call"
+
+    def render(self):
+        import json
+        input_str = json.dumps(self.input_data, indent=2)[:500]
+        return Panel(
+            f"[cyan]{self.tool_name}[/cyan]\n{input_str}",
+            title="🔧 Tool Call",
+            border_style="yellow"
+        )
+
+
+class ToolResultWidget(Static):
+    """Display a tool result"""
+
+    def __init__(self, name: str, output: str, **kwargs):
+        super().__init__(**kwargs)
+        self.tool_name = name
+        self.output = output[:2000]  # Truncate
+        self.classes = "tool-result"
+
+    def render(self):
+        return Panel(
+            self.output,
+            title=f"✓ {self.tool_name}",
+            border_style="green"
+        )
 ```
 
-#### 7.4 Base Template
-```html
-<!-- src/opencode/server/templates/base.html -->
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>OpenCode</title>
-    <!-- HTMX -->
-    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
-    <script src="https://unpkg.com/htmx.org/dist/ext/sse.js"></script>
-    <!-- Pico CSS for minimal styling -->
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
-    <style>
-        :root { --pico-font-family: 'SF Mono', 'Fira Code', monospace; }
-        .message { margin: 1rem 0; padding: 1rem; border-radius: 8px; }
-        .message.user { background: #e3f2fd; }
-        .message.assistant { background: #f5f5f5; }
-        .tool-call { background: #fff3e0; padding: 0.5rem; margin: 0.5rem 0; }
-        .tool-result { background: #e8f5e9; padding: 0.5rem; margin: 0.5rem 0; }
-        #messages { max-height: 70vh; overflow-y: auto; }
-        pre { background: #263238; color: #aed581; padding: 1rem; overflow-x: auto; }
-    </style>
-</head>
-<body>
-    <main class="container">{% block content %}{% endblock %}</main>
-</body>
-</html>
-```
-
-#### 7.5 Home Template
-```html
-<!-- src/opencode/server/templates/home.html -->
-{% extends "base.html" %}
-{% block content %}
-<nav>
-    <ul><li><strong>OpenCode</strong></li></ul>
-    <ul><li><a href="/session/new" role="button">New Session</a></li></ul>
-</nav>
-
-<h2>Sessions</h2>
-{% if sessions %}
-<table>
-    <thead><tr><th>ID</th><th>Created</th><th>Messages</th><th></th></tr></thead>
-    <tbody>
-        {% for s in sessions %}
-        <tr>
-            <td><code>{{ s.id }}</code></td>
-            <td>{{ s.created_at[:16] }}</td>
-            <td>{{ s.messages }}</td>
-            <td><a href="/session/{{ s.id }}">Open</a></td>
-        </tr>
-        {% endfor %}
-    </tbody>
-</table>
-{% else %}
-<p>No sessions yet. <a href="/session/new">Create one</a></p>
-{% endif %}
-{% endblock %}
-```
-
-#### 7.6 Session Chat Template
-```html
-<!-- src/opencode/server/templates/session.html -->
-{% extends "base.html" %}
-{% block content %}
-<nav>
-    <ul><li><a href="/">← Sessions</a></li></ul>
-    <ul><li><strong>{{ session.id }}</strong></li></ul>
-</nav>
-
-<!-- Messages with SSE streaming -->
-<div id="messages" hx-ext="sse" sse-connect="/api/session/{{ session.id }}/stream">
-    {% for msg in session.messages %}
-    <div class="message {{ msg.role }}">
-        <strong>{{ 'You' if msg.role == 'user' else 'Assistant' }}</strong>
-        <div>{{ msg.content }}</div>
-    </div>
-    {% endfor %}
-    <div id="streaming" style="display:none;" class="message assistant">
-        <strong>Assistant</strong>
-        <div id="streaming-content"></div>
-    </div>
-</div>
-
-<!-- Input -->
-<form hx-post="/api/session/{{ session.id }}/message"
-      hx-target="#messages" hx-swap="beforeend"
-      hx-on::after-request="this.reset()">
-    <fieldset role="group">
-        <input type="text" name="content" placeholder="Message..." autofocus>
-        <button type="submit">Send</button>
-    </fieldset>
-</form>
-
-<script>
-document.body.addEventListener('htmx:sseMessage', (e) => {
-    const streaming = document.getElementById('streaming');
-    const content = document.getElementById('streaming-content');
-    const data = JSON.parse(e.detail.data);
-
-    if (e.detail.type === 'text') {
-        streaming.style.display = 'block';
-        content.textContent += data.content;
-    } else if (e.detail.type === 'done') {
-        streaming.style.display = 'none';
-        content.textContent = '';
-    }
-});
-</script>
-{% endblock %}
-```
-
-#### 7.7 Wire Up Web Routes
+#### 7.6 Chat Screen
 ```python
-# src/opencode/server/app.py - add at bottom
-from .web import router as web_router
-app.include_router(web_router)
-```
-
-**Checkpoint: Web UI with real-time streaming!**
-
----
-
-## Phase 8: Textual TUI (Days 29-32) - Optional
-
-### Goal: Upgrade to rich Textual-based TUI
-
-```python
-# src/opencode/tui_textual.py
-from textual.app import App, ComposeResult
-from textual.containers import Container, ScrollableContainer
-from textual.widgets import Header, Footer, Input, Static
+# src/opencode/tui/screens/chat.py
+from textual.app import ComposeResult
+from textual.screen import Screen
+from textual.containers import ScrollableContainer, Horizontal
+from textual.widgets import Header, Footer, Input, Static, Button
 from textual.binding import Binding
 from textual import work
-import httpx
 
-class OpenCodeApp(App):
-    CSS = """
-    #messages { height: 1fr; border: solid $surface; }
-    .user { background: $primary-darken-3; margin: 1; padding: 1; }
-    .assistant { background: $surface; margin: 1; padding: 1; }
-    """
+from ..client import OpenCodeClient
+from ..widgets.message import MessageWidget, ToolCallWidget, ToolResultWidget
 
-    BINDINGS = [Binding("ctrl+q", "quit", "Quit")]
+class ChatScreen(Screen):
+    """Main chat interface"""
+
+    BINDINGS = [
+        Binding("escape", "go_back", "Back"),
+        Binding("ctrl+n", "new_session", "New"),
+        Binding("ctrl+l", "clear", "Clear"),
+    ]
+
+    def __init__(self, session_id: str, client: OpenCodeClient, **kwargs):
+        super().__init__(**kwargs)
+        self.session_id = session_id
+        self.client = client
+        self.current_assistant_widget = None
 
     def compose(self) -> ComposeResult:
         yield Header()
         yield ScrollableContainer(id="messages")
-        yield Input(placeholder="Type message...", id="input")
+        yield Horizontal(
+            Input(placeholder="Type your message...", id="input"),
+            Button("Send", id="send", variant="primary"),
+            id="input-area"
+        )
+        yield Footer()
+
+    async def on_mount(self):
+        """Load existing messages"""
+        session = await self.client.get_session(self.session_id)
+        messages = self.query_one("#messages", ScrollableContainer)
+
+        for msg in session.get("messages", []):
+            if isinstance(msg["content"], str):
+                messages.mount(MessageWidget(role=msg["role"], content=msg["content"]))
+
+        # Focus input
+        self.query_one("#input", Input).focus()
+
+    async def on_input_submitted(self, event: Input.Submitted):
+        """Handle message submission"""
+        await self._send_message(event.value)
+        event.input.value = ""
+
+    async def on_button_pressed(self, event: Button.Pressed):
+        """Handle send button"""
+        if event.button.id == "send":
+            input_widget = self.query_one("#input", Input)
+            await self._send_message(input_widget.value)
+            input_widget.value = ""
+            input_widget.focus()
+
+    @work
+    async def _send_message(self, content: str):
+        """Send message and stream response"""
+        if not content.strip():
+            return
+
+        messages = self.query_one("#messages", ScrollableContainer)
+
+        # Add user message
+        messages.mount(MessageWidget(role="user", content=content))
+        messages.scroll_end()
+
+        # Create assistant message widget for streaming
+        self.current_assistant_widget = MessageWidget(role="assistant", content="")
+        messages.mount(self.current_assistant_widget)
+
+        # Stream response
+        async for event in self.client.send_message(self.session_id, content):
+            if event.type == "text":
+                self.current_assistant_widget.append_content(event.data.get("content", ""))
+                messages.scroll_end()
+
+            elif event.type == "tool_call":
+                messages.mount(ToolCallWidget(
+                    name=event.data.get("name", ""),
+                    input_data=event.data.get("input", {})
+                ))
+                messages.scroll_end()
+
+            elif event.type == "tool_result":
+                messages.mount(ToolResultWidget(
+                    name=event.data.get("name", ""),
+                    output=event.data.get("output", "")
+                ))
+                messages.scroll_end()
+
+            elif event.type == "done":
+                self.current_assistant_widget = None
+
+    def action_go_back(self):
+        """Return to home screen"""
+        self.app.pop_screen()
+
+    def action_clear(self):
+        """Clear messages"""
+        messages = self.query_one("#messages", ScrollableContainer)
+        messages.remove_children()
+```
+
+#### 7.7 Home Screen
+```python
+# src/opencode/tui/screens/home.py
+from textual.app import ComposeResult
+from textual.screen import Screen
+from textual.containers import Container, Vertical
+from textual.widgets import Header, Footer, Static, Button, DataTable
+from textual.binding import Binding
+from textual import work
+
+from ..client import OpenCodeClient
+
+class HomeScreen(Screen):
+    """Session list and selection"""
+
+    BINDINGS = [
+        Binding("n", "new_session", "New Session"),
+        Binding("r", "refresh", "Refresh"),
+        Binding("q", "quit", "Quit"),
+    ]
+
+    def __init__(self, client: OpenCodeClient, **kwargs):
+        super().__init__(**kwargs)
+        self.client = client
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Container(
+            Static("[bold]OpenCode[/bold] - AI Coding Assistant", id="title"),
+            DataTable(id="sessions"),
+            Button("+ New Session", id="new-session", variant="primary"),
+            id="main"
+        )
+        yield Footer()
+
+    async def on_mount(self):
+        """Load sessions on mount"""
+        await self._load_sessions()
+
+    @work
+    async def _load_sessions(self):
+        """Load sessions into table"""
+        table = self.query_one("#sessions", DataTable)
+        table.clear(columns=True)
+        table.add_columns("ID", "Title", "Messages", "Created")
+        table.cursor_type = "row"
+
+        sessions = await self.client.list_sessions()
+        for s in sessions:
+            table.add_row(
+                s["id"],
+                s.get("title", "Untitled")[:30],
+                str(s.get("message_count", 0)),
+                s["created_at"][:16]
+            )
+
+    async def on_data_table_row_selected(self, event: DataTable.RowSelected):
+        """Open selected session"""
+        row_key = event.row_key
+        table = self.query_one("#sessions", DataTable)
+        session_id = table.get_cell(row_key, "ID")
+
+        from .chat import ChatScreen
+        self.app.push_screen(ChatScreen(session_id, self.client))
+
+    async def on_button_pressed(self, event: Button.Pressed):
+        """Handle new session button"""
+        if event.button.id == "new-session":
+            await self.action_new_session()
+
+    @work
+    async def action_new_session(self):
+        """Create new session and open it"""
+        session = await self.client.create_session()
+        from .chat import ChatScreen
+        self.app.push_screen(ChatScreen(session["id"], self.client))
+
+    async def action_refresh(self):
+        """Refresh session list"""
+        await self._load_sessions()
+```
+
+#### 7.8 Main App
+```python
+# src/opencode/tui/app.py
+from textual.app import App
+from textual.binding import Binding
+
+from .client import OpenCodeClient
+from .screens.home import HomeScreen
+
+class OpenCodeTUI(App):
+    """OpenCode Terminal UI Application"""
+
+    TITLE = "OpenCode"
+    CSS_PATH = "styles.tcss"
+
+    BINDINGS = [
+        Binding("ctrl+q", "quit", "Quit", show=True),
+        Binding("ctrl+d", "toggle_dark", "Dark Mode"),
+    ]
+
+    def __init__(self, server_url: str = "http://localhost:8080"):
+        super().__init__()
+        self.client = OpenCodeClient(server_url)
+
+    async def on_mount(self):
+        """Push home screen on start"""
+        self.push_screen(HomeScreen(self.client))
+
+    async def on_unmount(self):
+        """Cleanup client on exit"""
+        await self.client.close()
+
+    def action_toggle_dark(self):
+        """Toggle dark mode"""
+        self.dark = not self.dark
+
+
+def run_tui(server_url: str = "http://localhost:8080"):
+    """Entry point for TUI"""
+    app = OpenCodeTUI(server_url)
+    app.run()
+```
+
+#### 7.9 Textual CSS Styles
+```css
+/* src/opencode/tui/styles.tcss */
+
+Screen {
+    background: $surface;
+}
+
+#title {
+    text-align: center;
+    padding: 1;
+    text-style: bold;
+    color: $text;
+}
+
+#main {
+    padding: 1 2;
+}
+
+#messages {
+    height: 1fr;
+    border: solid $primary;
+    padding: 1;
+    margin-bottom: 1;
+}
+
+#input-area {
+    height: auto;
+    dock: bottom;
+}
+
+#input-area Input {
+    width: 1fr;
+}
+
+#input-area Button {
+    width: auto;
+    margin-left: 1;
+}
+
+/* Message styling */
+.user {
+    margin: 1 0;
+    background: $primary-darken-2;
+}
+
+.assistant {
+    margin: 1 0;
+    background: $surface-darken-1;
+}
+
+.tool-call {
+    margin: 0 2;
+    background: $warning-darken-2;
+}
+
+.tool-result {
+    margin: 0 2;
+    background: $success-darken-2;
+}
+
+/* Session table */
+#sessions {
+    height: auto;
+    max-height: 70%;
+    margin: 1 0;
+}
+
+DataTable > .datatable--cursor {
+    background: $primary;
+}
+
+/* Buttons */
+#new-session {
+    margin-top: 1;
+    width: 100%;
+}
+```
+
+#### 7.10 CLI Integration
+```python
+# Add to cli.py
+
+@app.command()
+def ui(
+    server: str = typer.Option("http://localhost:8080", "--server", "-s",
+                               help="Server URL to connect to"),
+):
+    """Launch Textual TUI (requires server running)"""
+    from .tui.app import run_tui
+    console.print(f"[dim]Connecting to {server}...[/dim]")
+    run_tui(server)
+```
+
+#### 7.11 Standalone Mode (No Server)
+```python
+# src/opencode/tui/standalone.py
+"""Standalone TUI that doesn't require a server"""
+
+from textual.app import App, ComposeResult
+from textual.containers import ScrollableContainer, Horizontal
+from textual.widgets import Header, Footer, Input, Button
+from textual.binding import Binding
+from textual import work
+
+from ..agent import run_agent_loop_async
+from ..provider import AsyncProvider
+from ..models import Session
+from ..storage import save_session
+from .widgets.message import MessageWidget, ToolCallWidget, ToolResultWidget
+import uuid
+
+class StandaloneTUI(App):
+    """TUI that runs agent directly without server"""
+
+    CSS_PATH = "styles.tcss"
+    BINDINGS = [Binding("ctrl+q", "quit", "Quit")]
+
+    def __init__(self):
+        super().__init__()
+        self.session = Session(id=str(uuid.uuid4())[:8])
+        self.provider = AsyncProvider()
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield ScrollableContainer(id="messages")
+        yield Horizontal(
+            Input(placeholder="Type your message...", id="input"),
+            Button("Send", id="send", variant="primary"),
+            id="input-area"
+        )
         yield Footer()
 
     async def on_input_submitted(self, event: Input.Submitted):
-        if not event.value.strip():
-            return
-        msg = event.value
+        await self._send_message(event.value)
         event.input.value = ""
 
-        messages = self.query_one("#messages")
-        messages.mount(Static(f"You: {msg}", classes="user"))
-
-        await self.stream_response(msg)
-
     @work
-    async def stream_response(self, content: str):
-        messages = self.query_one("#messages")
-        response_widget = Static("Assistant: ", classes="assistant")
-        messages.mount(response_widget)
+    async def _send_message(self, content: str):
+        if not content.strip():
+            return
 
-        async with httpx.AsyncClient(timeout=120) as client:
-            async with client.stream("POST", "http://localhost:8080/api/session/default/message",
-                                     json={"content": content}) as resp:
-                text = "Assistant: "
-                async for line in resp.aiter_lines():
-                    if line.startswith("data:"):
-                        import json
-                        data = json.loads(line[5:])
-                        if "content" in data:
-                            text += data["content"]
-                            response_widget.update(text)
+        messages = self.query_one("#messages", ScrollableContainer)
 
-if __name__ == "__main__":
-    OpenCodeApp().run()
+        # User message
+        messages.mount(MessageWidget(role="user", content=content))
+
+        # Assistant streaming
+        assistant_widget = MessageWidget(role="assistant", content="")
+        messages.mount(assistant_widget)
+
+        async for event in run_agent_loop_async(self.session, content, self.provider):
+            if event["type"] == "text":
+                assistant_widget.append_content(event["content"])
+            elif event["type"] == "tool_call":
+                messages.mount(ToolCallWidget(event["name"], event["input"]))
+            elif event["type"] == "tool_result":
+                messages.mount(ToolResultWidget(event["name"], event["output"]))
+
+            messages.scroll_end()
+
+        save_session(self.session)
+
+
+def run_standalone():
+    StandaloneTUI().run()
 ```
+
+```python
+# Add to cli.py
+
+@app.command()
+def tui():
+    """Launch standalone Textual TUI (no server needed)"""
+    from .tui.standalone import run_standalone
+    run_standalone()
+```
+
+**Checkpoint: Beautiful Textual TUI with full features!**
 
 ---
 
@@ -1832,8 +2173,6 @@ opencode-py/
 │       ├── __init__.py           # Version info
 │       ├── __main__.py           # Entry: python -m opencode
 │       ├── cli.py                # Typer CLI (~150 lines)
-│       ├── tui.py                # Rich TUI (~250 lines)
-│       ├── tui_textual.py        # Textual TUI (~150 lines)
 │       ├── agent.py              # Agent loop (~300 lines)
 │       ├── provider.py           # Anthropic client (~120 lines)
 │       ├── tools.py              # All tools (~400 lines)
@@ -1842,22 +2181,30 @@ opencode-py/
 │       ├── models.py             # Pydantic models (~100 lines)
 │       ├── bus.py                # Event bus (~60 lines)
 │       │
-│       └── server/               # HTTP Backend
+│       ├── server/               # HTTP Backend
+│       │   ├── __init__.py
+│       │   └── app.py            # FastAPI app (~250 lines)
+│       │
+│       └── tui/                  # Textual TUI
 │           ├── __init__.py
-│           ├── app.py            # FastAPI app (~250 lines)
-│           ├── web.py            # Web routes (~50 lines)
-│           ├── templates.py      # Jinja2 setup (~10 lines)
-│           └── templates/        # HTML templates
-│               ├── base.html
-│               ├── home.html
-│               └── session.html
+│           ├── app.py            # Main app (~50 lines)
+│           ├── standalone.py     # Standalone mode (~80 lines)
+│           ├── client.py         # API client (~60 lines)
+│           ├── styles.tcss       # CSS styles (~80 lines)
+│           ├── screens/
+│           │   ├── __init__.py
+│           │   ├── home.py       # Session list (~100 lines)
+│           │   └── chat.py       # Chat screen (~120 lines)
+│           └── widgets/
+│               ├── __init__.py
+│               └── message.py    # Message widgets (~80 lines)
 │
 └── tests/
     ├── test_tools.py
     ├── test_storage.py
     └── test_server.py
 
-Total: ~2,000 lines of Python
+Total: ~2,100 lines of Python
 ```
 
 ---
@@ -1882,13 +2229,14 @@ dependencies = [
     "fastapi>=0.109.0",
     "uvicorn>=0.27.0",
     "sse-starlette>=1.8.0",
-    "jinja2>=3.1.0",
-    "python-multipart>=0.0.6",
+
+    # TUI
+    "textual>=0.47.0",
+    "httpx>=0.26.0",
 ]
 
 [project.optional-dependencies]
-web = ["httpx>=0.26.0", "beautifulsoup4>=4.12.0"]
-tui = ["textual>=0.47.0"]
+web = ["beautifulsoup4>=4.12.0"]  # For web_fetch tool
 dev = ["pytest>=7.0.0", "pytest-asyncio>=0.23.0", "ruff>=0.1.0"]
 
 [project.scripts]
@@ -1915,20 +2263,17 @@ opencode run "Create a hello world Python script"
 # CLI mode - interactive chat
 opencode chat
 
-# Rich TUI mode
+# Standalone TUI (no server needed)
 opencode tui
 
 # Resume session
 opencode chat --session abc123
 
-# Start HTTP server (for web/remote access)
+# Start HTTP server (for remote TUI access)
 opencode serve --port 8080
 
-# Open web UI in browser
-open http://localhost:8080
-
 # Textual TUI (connects to server)
-opencode ui
+opencode ui --server http://localhost:8080
 ```
 
 ---
@@ -1956,11 +2301,10 @@ After MVP is working, add in order of value:
 | 4 | 11-14 | Config, polish, more tools |
 | 5 | 15-17 | Web fetch, tree, testing |
 | 6 | 18-22 | **HTTP Backend (FastAPI + SSE)** |
-| 7 | 23-28 | **Web Frontend (HTMX + Jinja2)** |
-| 8 | 29-32 | Textual TUI (optional) |
-| **32** | | **Full MVP Complete** |
+| 7 | 23-26 | **Textual TUI (standalone + server mode)** |
+| **26** | | **Full MVP Complete** |
 
-**~6 weeks to a fully functional AI coding assistant with CLI, Web UI, and API!**
+**~4.5 weeks to a fully functional AI coding assistant with CLI, TUI, and API!**
 
 ---
 
@@ -1972,36 +2316,37 @@ After MVP is working, add in order of value:
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                  │
 │   Clients                                                        │
-│   ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐           │
-│   │   CLI   │  │Rich TUI │  │  Web UI │  │Textual  │           │
-│   │ (Typer) │  │ (Rich)  │  │ (HTMX)  │  │  TUI    │           │
-│   └────┬────┘  └────┬────┘  └────┬────┘  └────┬────┘           │
-│        │            │            │            │                  │
-│        │    Direct  │            │    HTTP    │                  │
-│        └────────────┤            └────────────┤                  │
-│                     │                         │                  │
-│                     ▼                         ▼                  │
-│   ┌─────────────────────────────────────────────────────────┐   │
-│   │                 FastAPI Server                           │   │
-│   │  • REST API endpoints                                    │   │
-│   │  • SSE streaming (/api/events)                          │   │
-│   │  • Jinja2 templates                                      │   │
-│   └─────────────────────────┬───────────────────────────────┘   │
-│                             │                                    │
-│   ┌─────────────────────────┼───────────────────────────────┐   │
-│   │                    Core Layer                            │   │
-│   │  ┌──────────┐  ┌──────────┐  ┌──────────┐              │   │
-│   │  │  Agent   │  │ Session  │  │   Tool   │              │   │
-│   │  │  Loop    │  │ Manager  │  │ Registry │              │   │
-│   │  └────┬─────┘  └────┬─────┘  └────┬─────┘              │   │
-│   │       │             │             │                      │   │
-│   │       ▼             ▼             ▼                      │   │
-│   │  ┌──────────┐  ┌──────────┐  ┌──────────┐              │   │
-│   │  │ Provider │  │ Storage  │  │Event Bus │              │   │
-│   │  │(Anthropic│  │  (JSON)  │  │  (Pub/   │              │   │
-│   │  │   SDK)   │  │          │  │   Sub)   │              │   │
-│   │  └──────────┘  └──────────┘  └──────────┘              │   │
-│   └─────────────────────────────────────────────────────────┘   │
+│   ┌─────────┐  ┌─────────┐  ┌────────────┐                     │
+│   │   CLI   │  │Rich TUI │  │Textual TUI │                     │
+│   │ (Typer) │  │ (Rich)  │  │ (Textual)  │                     │
+│   └────┬────┘  └────┬────┘  └─────┬──────┘                     │
+│        │            │             │                              │
+│        │    Direct  │             │  HTTP (optional)            │
+│        └────────────┤             ├────────────┐                │
+│                     │             │            │                 │
+│                     ▼             ▼            ▼                 │
+│   ┌─────────────────────────┐  ┌───────────────────────────┐   │
+│   │      Core Layer         │  │     FastAPI Server        │   │
+│   │  (Standalone Mode)      │  │  • REST API endpoints     │   │
+│   │                         │  │  • SSE streaming          │   │
+│   └───────────┬─────────────┘  └─────────────┬─────────────┘   │
+│               │                              │                   │
+│               └──────────────┬───────────────┘                  │
+│                              │                                   │
+│   ┌──────────────────────────┼───────────────────────────────┐  │
+│   │                    Core Layer                             │  │
+│   │  ┌──────────┐  ┌──────────┐  ┌──────────┐               │  │
+│   │  │  Agent   │  │ Session  │  │   Tool   │               │  │
+│   │  │  Loop    │  │ Manager  │  │ Registry │               │  │
+│   │  └────┬─────┘  └────┬─────┘  └────┬─────┘               │  │
+│   │       │             │             │                       │  │
+│   │       ▼             ▼             ▼                       │  │
+│   │  ┌──────────┐  ┌──────────┐  ┌──────────┐               │  │
+│   │  │ Provider │  │ Storage  │  │Event Bus │               │  │
+│   │  │(Anthropic│  │  (JSON)  │  │  (Pub/   │               │  │
+│   │  │   SDK)   │  │          │  │   Sub)   │               │  │
+│   │  └──────────┘  └──────────┘  └──────────┘               │  │
+│   └──────────────────────────────────────────────────────────┘  │
 │                                                                  │
 └─────────────────────────────────────────────────────────────────┘
 ```
