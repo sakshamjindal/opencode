@@ -1207,6 +1207,620 @@ elif name == "tree":
 
 ---
 
+## Phase 6: HTTP Backend (Days 18-22)
+
+### Goal: FastAPI server so TUI/Web can connect remotely
+
+#### 6.1 Server Setup
+```python
+# src/opencode/server/__init__.py
+from .app import app, run_server
+
+# src/opencode/server/app.py
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from sse_starlette.sse import EventSourceResponse
+from pydantic import BaseModel
+from typing import Optional
+import asyncio
+import uuid
+
+from ..models import Session, Message
+from ..storage import save_session, load_session, list_sessions
+from ..agent import run_agent_loop_async
+from ..provider import AsyncProvider
+from ..bus import bus
+
+app = FastAPI(title="OpenCode", version="0.1.0")
+
+# CORS for web frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Request/Response models
+class CreateSessionRequest(BaseModel):
+    project_id: str = "default"
+    directory: str = "."
+
+class SendMessageRequest(BaseModel):
+    content: str
+
+class SessionResponse(BaseModel):
+    id: str
+    title: str
+    created_at: str
+    message_count: int
+
+
+# ============== Session Endpoints ==============
+
+@app.post("/api/session", response_model=SessionResponse)
+async def create_session(req: CreateSessionRequest):
+    """Create a new session"""
+    session = Session(
+        id=str(uuid.uuid4())[:8],
+        project_id=req.project_id,
+        directory=req.directory
+    )
+    save_session(session)
+    await bus.publish("session.created", session)
+
+    return SessionResponse(
+        id=session.id,
+        title=session.title or "New Session",
+        created_at=session.created_at.isoformat(),
+        message_count=0
+    )
+
+
+@app.get("/api/session")
+async def get_sessions():
+    """List all sessions"""
+    sessions = list_sessions()
+    return [
+        SessionResponse(
+            id=s["id"],
+            title=s.get("title", "Untitled"),
+            created_at=s["created_at"],
+            message_count=s["messages"]
+        )
+        for s in sessions
+    ]
+
+
+@app.get("/api/session/{session_id}")
+async def get_session(session_id: str):
+    """Get session with messages"""
+    session = load_session(session_id)
+    if not session:
+        raise HTTPException(404, "Session not found")
+
+    return {
+        "id": session.id,
+        "title": session.title,
+        "created_at": session.created_at.isoformat(),
+        "messages": [
+            {
+                "role": m.role,
+                "content": m.content,
+                "timestamp": m.timestamp.isoformat()
+            }
+            for m in session.messages
+        ]
+    }
+
+
+# ============== Message Endpoints ==============
+
+@app.post("/api/session/{session_id}/message")
+async def send_message(session_id: str, req: SendMessageRequest):
+    """Send a message and get streaming response"""
+    session = load_session(session_id)
+    if not session:
+        raise HTTPException(404, "Session not found")
+
+    # Return SSE stream
+    return EventSourceResponse(
+        stream_agent_response(session, req.content)
+    )
+
+
+async def stream_agent_response(session: Session, user_message: str):
+    """Generator for SSE streaming"""
+    import json
+
+    # Emit user message
+    yield {
+        "event": "message",
+        "data": json.dumps({
+            "role": "user",
+            "content": user_message
+        })
+    }
+
+    provider = AsyncProvider()
+
+    # Stream assistant response
+    async for event in run_agent_loop_async(session, user_message, provider):
+        if event["type"] == "text":
+            yield {
+                "event": "text",
+                "data": json.dumps({"content": event["content"]})
+            }
+        elif event["type"] == "tool_call":
+            yield {
+                "event": "tool_call",
+                "data": json.dumps({
+                    "name": event["name"],
+                    "input": event["input"]
+                })
+            }
+        elif event["type"] == "tool_result":
+            yield {
+                "event": "tool_result",
+                "data": json.dumps({
+                    "name": event["name"],
+                    "output": event["output"]
+                })
+            }
+
+    # Save session
+    save_session(session)
+
+    yield {
+        "event": "done",
+        "data": json.dumps({"session_id": session.id})
+    }
+
+
+# ============== Event Stream ==============
+
+@app.get("/api/events")
+async def event_stream():
+    """Global event stream for real-time updates"""
+    return EventSourceResponse(bus_events())
+
+
+async def bus_events():
+    """Generator for bus events"""
+    import json
+    queue = asyncio.Queue()
+
+    async def handler(event_type: str, data):
+        await queue.put((event_type, data))
+
+    unsubscribe = bus.subscribe_all(handler)
+
+    try:
+        while True:
+            event_type, data = await queue.get()
+            yield {
+                "event": event_type,
+                "data": data.model_dump_json() if hasattr(data, 'model_dump_json') else json.dumps(data)
+            }
+    finally:
+        unsubscribe()
+
+
+# ============== Tool Endpoints ==============
+
+@app.get("/api/tools")
+async def list_tools():
+    """List available tools"""
+    from ..tools import TOOLS
+    return TOOLS
+
+
+# ============== Run Server ==============
+
+def run_server(host: str = "127.0.0.1", port: int = 8080):
+    """Run the server"""
+    import uvicorn
+    uvicorn.run(app, host=host, port=port)
+```
+
+#### 6.2 Async Provider
+```python
+# src/opencode/provider.py - add async version
+
+import anthropic
+from typing import AsyncGenerator
+
+class AsyncProvider:
+    def __init__(self):
+        self.client = anthropic.AsyncAnthropic()
+        self.model = "claude-sonnet-4-20250514"
+
+    async def stream(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        system: str | None = None
+    ) -> AsyncGenerator:
+        """Async streaming response"""
+        async with self.client.messages.stream(
+            model=self.model,
+            max_tokens=8192,
+            system=system or "You are a helpful coding assistant.",
+            messages=messages,
+            tools=tools or []
+        ) as stream:
+            async for event in stream:
+                yield event
+```
+
+#### 6.3 Async Agent Loop
+```python
+# src/opencode/agent.py - add async version
+
+async def run_agent_loop_async(session: Session, user_message: str, provider: AsyncProvider):
+    """Async agent loop that yields events for streaming"""
+    from .tools import TOOLS, execute_tool_async
+
+    session.messages.append(Message(role="user", content=user_message))
+
+    while True:
+        api_messages = format_messages(session.messages)
+
+        assistant_content = []
+        tool_calls = []
+        current_text = ""
+
+        async for event in provider.stream(api_messages, tools=TOOLS, system=SYSTEM_PROMPT):
+            if event.type == "content_block_delta":
+                if hasattr(event.delta, "text"):
+                    current_text += event.delta.text
+                    yield {"type": "text", "content": event.delta.text}
+
+            elif event.type == "content_block_start":
+                if event.content_block.type == "tool_use":
+                    tool_calls.append({
+                        "id": event.content_block.id,
+                        "name": event.content_block.name,
+                        "input": {}
+                    })
+
+            elif event.type == "message_stop":
+                break
+
+        # Add assistant message
+        if current_text:
+            assistant_content.append({"type": "text", "text": current_text})
+
+        for tc in tool_calls:
+            assistant_content.append({
+                "type": "tool_use",
+                "id": tc["id"],
+                "name": tc["name"],
+                "input": tc["input"]
+            })
+
+        session.messages.append(Message(role="assistant", content=assistant_content))
+
+        # If no tool calls, done
+        if not tool_calls:
+            break
+
+        # Execute tools
+        tool_results = []
+        for tc in tool_calls:
+            yield {"type": "tool_call", "name": tc["name"], "input": tc["input"]}
+
+            result = await execute_tool_async(tc["name"], tc["input"])
+            yield {"type": "tool_result", "name": tc["name"], "output": result}
+
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": tc["id"],
+                "content": result
+            })
+
+        session.messages.append(Message(role="user", content=tool_results))
+```
+
+#### 6.4 Event Bus (Async)
+```python
+# src/opencode/bus.py
+from typing import Callable, Any
+from collections import defaultdict
+import asyncio
+
+class EventBus:
+    def __init__(self):
+        self._subscribers: dict[str, list[Callable]] = defaultdict(list)
+        self._global_subscribers: list[Callable] = []
+
+    def subscribe(self, event_type: str, callback: Callable):
+        self._subscribers[event_type].append(callback)
+        return lambda: self._subscribers[event_type].remove(callback)
+
+    def subscribe_all(self, callback: Callable):
+        self._global_subscribers.append(callback)
+        return lambda: self._global_subscribers.remove(callback)
+
+    async def publish(self, event_type: str, data: Any):
+        # Notify specific subscribers
+        for cb in self._subscribers[event_type]:
+            if asyncio.iscoroutinefunction(cb):
+                await cb(data)
+            else:
+                cb(data)
+
+        # Notify global subscribers
+        for cb in self._global_subscribers:
+            if asyncio.iscoroutinefunction(cb):
+                await cb(event_type, data)
+            else:
+                cb(event_type, data)
+
+# Global instance
+bus = EventBus()
+```
+
+#### 6.5 CLI Server Command
+```python
+# Add to cli.py
+
+@app.command()
+def serve(
+    host: str = typer.Option("127.0.0.1", "--host", "-h"),
+    port: int = typer.Option(8080, "--port", "-p"),
+):
+    """Start the HTTP server"""
+    from .server import run_server
+    console.print(f"[green]Starting server at http://{host}:{port}[/green]")
+    run_server(host, port)
+```
+
+**Checkpoint: HTTP API server with SSE streaming!**
+
+---
+
+## Phase 7: Web Frontend (Days 23-28)
+
+### Goal: Browser-based UI using HTMX + Jinja2
+
+#### 7.1 Why HTMX?
+- No JavaScript framework needed
+- Server-rendered HTML
+- SSE support built-in
+- Perfect for Python backends
+- ~14KB total
+
+#### 7.2 Templates Setup
+```python
+# src/opencode/server/templates.py
+from fastapi import Request
+from fastapi.templating import Jinja2Templates
+from pathlib import Path
+
+templates = Jinja2Templates(
+    directory=Path(__file__).parent / "templates"
+)
+```
+
+#### 7.3 Web Routes
+```python
+# src/opencode/server/web.py
+from fastapi import APIRouter, Request
+from fastapi.responses import HTMLResponse
+from .templates import templates
+from ..storage import list_sessions, load_session
+
+router = APIRouter()
+
+@router.get("/", response_class=HTMLResponse)
+async def home(request: Request):
+    """Home page with session list"""
+    sessions = list_sessions()
+    return templates.TemplateResponse(
+        "home.html",
+        {"request": request, "sessions": sessions}
+    )
+
+
+@router.get("/session/{session_id}", response_class=HTMLResponse)
+async def session_page(request: Request, session_id: str):
+    """Session chat page"""
+    session = load_session(session_id)
+    return templates.TemplateResponse(
+        "session.html",
+        {"request": request, "session": session}
+    )
+```
+
+#### 7.4 Base Template
+```html
+<!-- src/opencode/server/templates/base.html -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OpenCode</title>
+    <!-- HTMX -->
+    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+    <script src="https://unpkg.com/htmx.org/dist/ext/sse.js"></script>
+    <!-- Pico CSS for minimal styling -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+    <style>
+        :root { --pico-font-family: 'SF Mono', 'Fira Code', monospace; }
+        .message { margin: 1rem 0; padding: 1rem; border-radius: 8px; }
+        .message.user { background: #e3f2fd; }
+        .message.assistant { background: #f5f5f5; }
+        .tool-call { background: #fff3e0; padding: 0.5rem; margin: 0.5rem 0; }
+        .tool-result { background: #e8f5e9; padding: 0.5rem; margin: 0.5rem 0; }
+        #messages { max-height: 70vh; overflow-y: auto; }
+        pre { background: #263238; color: #aed581; padding: 1rem; overflow-x: auto; }
+    </style>
+</head>
+<body>
+    <main class="container">{% block content %}{% endblock %}</main>
+</body>
+</html>
+```
+
+#### 7.5 Home Template
+```html
+<!-- src/opencode/server/templates/home.html -->
+{% extends "base.html" %}
+{% block content %}
+<nav>
+    <ul><li><strong>OpenCode</strong></li></ul>
+    <ul><li><a href="/session/new" role="button">New Session</a></li></ul>
+</nav>
+
+<h2>Sessions</h2>
+{% if sessions %}
+<table>
+    <thead><tr><th>ID</th><th>Created</th><th>Messages</th><th></th></tr></thead>
+    <tbody>
+        {% for s in sessions %}
+        <tr>
+            <td><code>{{ s.id }}</code></td>
+            <td>{{ s.created_at[:16] }}</td>
+            <td>{{ s.messages }}</td>
+            <td><a href="/session/{{ s.id }}">Open</a></td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% else %}
+<p>No sessions yet. <a href="/session/new">Create one</a></p>
+{% endif %}
+{% endblock %}
+```
+
+#### 7.6 Session Chat Template
+```html
+<!-- src/opencode/server/templates/session.html -->
+{% extends "base.html" %}
+{% block content %}
+<nav>
+    <ul><li><a href="/">← Sessions</a></li></ul>
+    <ul><li><strong>{{ session.id }}</strong></li></ul>
+</nav>
+
+<!-- Messages with SSE streaming -->
+<div id="messages" hx-ext="sse" sse-connect="/api/session/{{ session.id }}/stream">
+    {% for msg in session.messages %}
+    <div class="message {{ msg.role }}">
+        <strong>{{ 'You' if msg.role == 'user' else 'Assistant' }}</strong>
+        <div>{{ msg.content }}</div>
+    </div>
+    {% endfor %}
+    <div id="streaming" style="display:none;" class="message assistant">
+        <strong>Assistant</strong>
+        <div id="streaming-content"></div>
+    </div>
+</div>
+
+<!-- Input -->
+<form hx-post="/api/session/{{ session.id }}/message"
+      hx-target="#messages" hx-swap="beforeend"
+      hx-on::after-request="this.reset()">
+    <fieldset role="group">
+        <input type="text" name="content" placeholder="Message..." autofocus>
+        <button type="submit">Send</button>
+    </fieldset>
+</form>
+
+<script>
+document.body.addEventListener('htmx:sseMessage', (e) => {
+    const streaming = document.getElementById('streaming');
+    const content = document.getElementById('streaming-content');
+    const data = JSON.parse(e.detail.data);
+
+    if (e.detail.type === 'text') {
+        streaming.style.display = 'block';
+        content.textContent += data.content;
+    } else if (e.detail.type === 'done') {
+        streaming.style.display = 'none';
+        content.textContent = '';
+    }
+});
+</script>
+{% endblock %}
+```
+
+#### 7.7 Wire Up Web Routes
+```python
+# src/opencode/server/app.py - add at bottom
+from .web import router as web_router
+app.include_router(web_router)
+```
+
+**Checkpoint: Web UI with real-time streaming!**
+
+---
+
+## Phase 8: Textual TUI (Days 29-32) - Optional
+
+### Goal: Upgrade to rich Textual-based TUI
+
+```python
+# src/opencode/tui_textual.py
+from textual.app import App, ComposeResult
+from textual.containers import Container, ScrollableContainer
+from textual.widgets import Header, Footer, Input, Static
+from textual.binding import Binding
+from textual import work
+import httpx
+
+class OpenCodeApp(App):
+    CSS = """
+    #messages { height: 1fr; border: solid $surface; }
+    .user { background: $primary-darken-3; margin: 1; padding: 1; }
+    .assistant { background: $surface; margin: 1; padding: 1; }
+    """
+
+    BINDINGS = [Binding("ctrl+q", "quit", "Quit")]
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield ScrollableContainer(id="messages")
+        yield Input(placeholder="Type message...", id="input")
+        yield Footer()
+
+    async def on_input_submitted(self, event: Input.Submitted):
+        if not event.value.strip():
+            return
+        msg = event.value
+        event.input.value = ""
+
+        messages = self.query_one("#messages")
+        messages.mount(Static(f"You: {msg}", classes="user"))
+
+        await self.stream_response(msg)
+
+    @work
+    async def stream_response(self, content: str):
+        messages = self.query_one("#messages")
+        response_widget = Static("Assistant: ", classes="assistant")
+        messages.mount(response_widget)
+
+        async with httpx.AsyncClient(timeout=120) as client:
+            async with client.stream("POST", "http://localhost:8080/api/session/default/message",
+                                     json={"content": content}) as resp:
+                text = "Assistant: "
+                async for line in resp.aiter_lines():
+                    if line.startswith("data:"):
+                        import json
+                        data = json.loads(line[5:])
+                        if "content" in data:
+                            text += data["content"]
+                            response_widget.update(text)
+
+if __name__ == "__main__":
+    OpenCodeApp().run()
+```
+
+---
+
 ## Final Project Structure
 
 ```
@@ -1215,26 +1829,40 @@ opencode-py/
 ├── README.md
 ├── src/
 │   └── opencode/
-│       ├── __init__.py          # Version info
-│       ├── __main__.py          # Entry: python -m opencode
-│       ├── cli.py               # Typer CLI (~150 lines)
-│       ├── tui.py               # Rich TUI (~250 lines)
-│       ├── agent.py             # Agent loop (~200 lines)
-│       ├── provider.py          # Anthropic client (~80 lines)
-│       ├── tools.py             # All tools (~400 lines)
-│       ├── storage.py           # JSON storage (~80 lines)
-│       ├── config.py            # Configuration (~60 lines)
-│       └── models.py            # Pydantic models (~80 lines)
+│       ├── __init__.py           # Version info
+│       ├── __main__.py           # Entry: python -m opencode
+│       ├── cli.py                # Typer CLI (~150 lines)
+│       ├── tui.py                # Rich TUI (~250 lines)
+│       ├── tui_textual.py        # Textual TUI (~150 lines)
+│       ├── agent.py              # Agent loop (~300 lines)
+│       ├── provider.py           # Anthropic client (~120 lines)
+│       ├── tools.py              # All tools (~400 lines)
+│       ├── storage.py            # JSON storage (~80 lines)
+│       ├── config.py             # Configuration (~60 lines)
+│       ├── models.py             # Pydantic models (~100 lines)
+│       ├── bus.py                # Event bus (~60 lines)
+│       │
+│       └── server/               # HTTP Backend
+│           ├── __init__.py
+│           ├── app.py            # FastAPI app (~250 lines)
+│           ├── web.py            # Web routes (~50 lines)
+│           ├── templates.py      # Jinja2 setup (~10 lines)
+│           └── templates/        # HTML templates
+│               ├── base.html
+│               ├── home.html
+│               └── session.html
+│
 └── tests/
     ├── test_tools.py
-    └── test_storage.py
+    ├── test_storage.py
+    └── test_server.py
 
-Total: ~1,300 lines of Python
+Total: ~2,000 lines of Python
 ```
 
 ---
 
-## Dependencies (Minimal)
+## Dependencies
 
 ```toml
 # pyproject.toml
@@ -1243,16 +1871,25 @@ name = "opencode"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
+    # Core
     "anthropic>=0.25.0",
     "typer>=0.9.0",
     "rich>=13.0.0",
     "pydantic>=2.0.0",
     "prompt-toolkit>=3.0.0",
+
+    # Server
+    "fastapi>=0.109.0",
+    "uvicorn>=0.27.0",
+    "sse-starlette>=1.8.0",
+    "jinja2>=3.1.0",
+    "python-multipart>=0.0.6",
 ]
 
 [project.optional-dependencies]
-web = ["httpx>=0.24.0", "beautifulsoup4>=4.12.0"]
-dev = ["pytest>=7.0.0", "ruff>=0.1.0"]
+web = ["httpx>=0.26.0", "beautifulsoup4>=4.12.0"]
+tui = ["textual>=0.47.0"]
+dev = ["pytest>=7.0.0", "pytest-asyncio>=0.23.0", "ruff>=0.1.0"]
 
 [project.scripts]
 opencode = "opencode.cli:app"
@@ -1272,17 +1909,26 @@ uv pip install -e .
 # Run
 export ANTHROPIC_API_KEY="your-key"
 
-# One-shot task
+# CLI mode - one-shot task
 opencode run "Create a hello world Python script"
 
-# Interactive chat
+# CLI mode - interactive chat
 opencode chat
 
-# TUI mode
+# Rich TUI mode
 opencode tui
 
 # Resume session
 opencode chat --session abc123
+
+# Start HTTP server (for web/remote access)
+opencode serve --port 8080
+
+# Open web UI in browser
+open http://localhost:8080
+
+# Textual TUI (connects to server)
+opencode ui
 ```
 
 ---
@@ -1292,24 +1938,70 @@ opencode chat --session abc123
 After MVP is working, add in order of value:
 
 1. **More Providers** - OpenAI, local models via Ollama
-2. **Better Streaming** - True streaming in TUI
-3. **Textual TUI** - Upgrade from Rich to Textual for better UX
-4. **grep Tool** - Proper ripgrep integration
-5. **LSP Integration** - Show errors after edits
-6. **MCP Support** - External tool servers
-7. **Web UI** - FastAPI + HTMX
+2. **grep Tool** - Proper ripgrep integration
+3. **LSP Integration** - Show errors after edits
+4. **MCP Support** - External tool servers
+5. **Authentication** - OAuth for multi-user support
+6. **Plugin System** - Extensible tool loading
 
 ---
 
 ## Timeline Summary
 
-| Day | Milestone |
-|-----|-----------|
-| 1-3 | Basic chat working |
-| 4-7 | Tools working (read/write/bash) |
-| 8-10 | Rich TUI with sessions |
-| 11-14 | Config, polish, more tools |
-| 15-17 | Web fetch, tree, testing |
-| **17** | **MVP Complete** |
+| Phase | Days | Milestone |
+|-------|------|-----------|
+| 1 | 1-3 | Basic chat working |
+| 2 | 4-7 | Tools working (read/write/bash/glob) |
+| 3 | 8-10 | Rich TUI with sessions |
+| 4 | 11-14 | Config, polish, more tools |
+| 5 | 15-17 | Web fetch, tree, testing |
+| 6 | 18-22 | **HTTP Backend (FastAPI + SSE)** |
+| 7 | 23-28 | **Web Frontend (HTMX + Jinja2)** |
+| 8 | 29-32 | Textual TUI (optional) |
+| **32** | | **Full MVP Complete** |
 
-**2.5 weeks to a fully functional AI coding assistant!**
+**~6 weeks to a fully functional AI coding assistant with CLI, Web UI, and API!**
+
+---
+
+## Architecture Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        OpenCode Python                           │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│   Clients                                                        │
+│   ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐           │
+│   │   CLI   │  │Rich TUI │  │  Web UI │  │Textual  │           │
+│   │ (Typer) │  │ (Rich)  │  │ (HTMX)  │  │  TUI    │           │
+│   └────┬────┘  └────┬────┘  └────┬────┘  └────┬────┘           │
+│        │            │            │            │                  │
+│        │    Direct  │            │    HTTP    │                  │
+│        └────────────┤            └────────────┤                  │
+│                     │                         │                  │
+│                     ▼                         ▼                  │
+│   ┌─────────────────────────────────────────────────────────┐   │
+│   │                 FastAPI Server                           │   │
+│   │  • REST API endpoints                                    │   │
+│   │  • SSE streaming (/api/events)                          │   │
+│   │  • Jinja2 templates                                      │   │
+│   └─────────────────────────┬───────────────────────────────┘   │
+│                             │                                    │
+│   ┌─────────────────────────┼───────────────────────────────┐   │
+│   │                    Core Layer                            │   │
+│   │  ┌──────────┐  ┌──────────┐  ┌──────────┐              │   │
+│   │  │  Agent   │  │ Session  │  │   Tool   │              │   │
+│   │  │  Loop    │  │ Manager  │  │ Registry │              │   │
+│   │  └────┬─────┘  └────┬─────┘  └────┬─────┘              │   │
+│   │       │             │             │                      │   │
+│   │       ▼             ▼             ▼                      │   │
+│   │  ┌──────────┐  ┌──────────┐  ┌──────────┐              │   │
+│   │  │ Provider │  │ Storage  │  │Event Bus │              │   │
+│   │  │(Anthropic│  │  (JSON)  │  │  (Pub/   │              │   │
+│   │  │   SDK)   │  │          │  │   Sub)   │              │   │
+│   │  └──────────┘  └──────────┘  └──────────┘              │   │
+│   └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
